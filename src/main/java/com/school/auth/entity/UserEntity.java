@@ -4,7 +4,7 @@ import jakarta.persistence.*;
 import lombok.*;
 
 @Entity
-@Table(name = "USER", schema = "identity")
+@Table(name = "app_user", schema = "identity")
 @Getter
 @Setter
 @NoArgsConstructor
@@ -32,6 +32,11 @@ public class UserEntity {
     @Column(name = "email", unique = true, nullable = false, length = 100)
     private String email;
 
+    @Builder.Default
     @Column(name = "is_active_flag", nullable = false)
     private boolean isActiveFlag = true;
+
+    @Builder.Default
+    @Column(name = "is_super_user", nullable = false)
+    private boolean isSuperUser = false;
 }

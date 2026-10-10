@@ -11,7 +11,7 @@ import java.util.Optional;
 @Repository
 public interface UserRepository extends JpaRepository<UserEntity, Long> {
 
-    Optional<UserEntity> findByEmail(String email);
+    Optional<UserEntity> findByEmailIgnoreCase(String email);
 
     @Query("SELECT u FROM UserEntity u WHERE u.phoneNumber = :phone OR u.alternatePhoneNumber = :phone")
     Optional<UserEntity> findByPhoneNumberOrAlternate(@Param("phone") String phone);

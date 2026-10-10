@@ -5,7 +5,7 @@ import lombok.*;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "school_invitation")
+@Table(name = "school_invitation", schema = "identity")
 @Getter
 @Setter
 @NoArgsConstructor
@@ -36,7 +36,8 @@ public class SchoolInvitation {
     @Column(nullable = false)
     private LocalDateTime expiresAt;
 
-    @Column(nullable = false)
+    @Builder.Default
+    @Column(name = "is_used", nullable = false)
     private boolean isUsed = false;
 
     @Column(nullable = false, updatable = false)

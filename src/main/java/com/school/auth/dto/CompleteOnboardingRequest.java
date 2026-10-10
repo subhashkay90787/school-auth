@@ -12,6 +12,10 @@ public record CompleteOnboardingRequest(
     @NotBlank(message = "Last name is required")
     String lastName,
 
-    @NotBlank(message = "Verified phone number is required")
-    String phoneNumber
+    @NotBlank(message = "Phone number is required")
+    String phoneNumber,
+
+    // Obtained via POST /api/v1/otp/send for phoneNumber
+    @NotBlank(message = "OTP for the phone number is required")
+    String otp
 ) {}

@@ -9,4 +9,6 @@ import java.util.Optional;
 @Repository
 public interface SchoolRepository extends JpaRepository<SchoolEntity, Long> {
     Optional<SchoolEntity> findByHostUrl(String hostUrl);
+
+    boolean existsBySchoolCode(String schoolCode);
 }

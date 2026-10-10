@@ -2,6 +2,7 @@ package com.school.auth.entity;
 
 import jakarta.persistence.*;
 import lombok.*;
+import java.util.ArrayList;
 import java.util.List;
 
 @Entity
@@ -12,6 +13,9 @@ import java.util.List;
 @AllArgsConstructor
 @Builder
 public class SchoolEntity {
+
+    public static final String STATUS_ACTIVE = "ACTIVE";
+    public static final String STATUS_INACTIVE = "INACTIVE";
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -24,7 +28,7 @@ public class SchoolEntity {
     @Column(name = "school_name", nullable = false, length = 150)
     private String schoolName;
 
-    @Column(name = "host_url", nullable = false, length = 255)
+    @Column(name = "host_url", unique = true, nullable = false, length = 255)
     private String hostUrl;
 
     @Column(name = "city", nullable = false, length = 100)
@@ -36,9 +40,11 @@ public class SchoolEntity {
     @Column(name = "country", nullable = false, length = 100)
     private String country;
 
+    @Builder.Default
     @Column(name = "status", length = 20)
-    private String status = "ACTIVE";
+    private String status = STATUS_ACTIVE;
 
+    @Builder.Default
     @ManyToMany
     @JoinTable(
             name = "SCHOOL_FEATURE",
@@ -46,5 +52,9 @@ public class SchoolEntity {
             joinColumns = @JoinColumn(name = "school_id"),
             inverseJoinColumns = @JoinColumn(name = "feature_id")
     )
-    private List<FeatureEntity> features;
+    private List<FeatureEntity> features = new ArrayList<>();
+
+    public boolean isActive() {
+        return STATUS_ACTIVE.equals(status);
+    }
 }

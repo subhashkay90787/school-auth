@@ -21,8 +21,10 @@ public class SchoolGrantService {
     public List<TokenPayloadDto.SchoolAccess> getSchoolGrantsForUser(Long userId) {
         List<UserSchoolStaffTypeEntity> mappings = userSchoolStaffTypeRepository.findActiveGrantsByUserId(userId);
 
-        // Group mappings by School to aggregate multiple roles and features per school
+        // Group mappings by School to aggregate multiple roles and features per school.
+        // Disabled schools are dropped, so they vanish from the next token issued or refreshed.
         Map<Long, List<UserSchoolStaffTypeEntity>> groupedBySchool = mappings.stream()
+                .filter(m -> m.getSchool().isActive())
                 .collect(Collectors.groupingBy(m -> m.getSchool().getSchoolId()));
 
         return groupedBySchool.values().stream().map(schoolMappings -> {

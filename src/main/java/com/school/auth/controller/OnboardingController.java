@@ -1,6 +1,7 @@
 package com.school.auth.controller;
 
 import com.school.auth.dto.CompleteOnboardingRequest;
+import com.school.auth.dto.UserCreationDto;
 import com.school.auth.entity.SchoolInvitation;
 import com.school.auth.repository.SchoolInvitationRepository;
 import com.school.auth.service.UserOnboardingService;
@@ -25,6 +26,9 @@ public class OnboardingController {
         if (invitation.isUsed() || invitation.getExpiresAt().isBefore(java.time.LocalDateTime.now())) {
             return ResponseEntity.badRequest().body("This invitation has expired or already been used.");
         }
+        if (!invitation.getSchool().isActive()) {
+            return ResponseEntity.badRequest().body("This school is disabled.");
+        }
 
         return ResponseEntity.ok(new InvitationDetailsResponse(
                 invitation.getEmail(),
@@ -34,14 +38,20 @@ public class OnboardingController {
     }
 
     @PostMapping("/complete")
-    public ResponseEntity<?> completeOnboarding(@Valid @RequestBody CompleteOnboardingRequest request) {
+    public ResponseEntity<UserCreationDto.UserCreatedResponse> completeOnboarding(@Valid @RequestBody CompleteOnboardingRequest request) {
         var user = onboardingService.completeOnboarding(
                 request.token(),
                 request.firstName(),
                 request.lastName(),
-                request.phoneNumber()
+                request.phoneNumber(),
+                request.otp()
         );
-        return ResponseEntity.ok(user);
+        return ResponseEntity.ok(new UserCreationDto.UserCreatedResponse(
+                user.getUserId(),
+                user.getEmail(),
+                user.getPhoneNumber(),
+                user.isActiveFlag() ? "ACTIVE" : "INACTIVE"
+        ));
     }
 }
 

@@ -25,7 +25,7 @@ public class SchoolFeatureController {
 
     @PostMapping
     @Transactional
-    public ResponseEntity<SchoolEntity> assignFeaturesToSchool(
+    public ResponseEntity<SchoolResponse> assignFeaturesToSchool(
             @PathVariable Long schoolId,
             @Valid @RequestBody AssignFeaturesRequest request) {
 
@@ -46,7 +46,7 @@ public class SchoolFeatureController {
         }
 
         SchoolEntity updatedSchool = schoolRepository.save(school);
-        return ResponseEntity.ok(updatedSchool);
+        return ResponseEntity.ok(SchoolResponse.from(updatedSchool));
     }
 }
 

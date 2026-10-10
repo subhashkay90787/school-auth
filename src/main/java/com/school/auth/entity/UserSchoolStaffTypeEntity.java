@@ -31,9 +31,11 @@ public class UserSchoolStaffTypeEntity {
     @JoinColumn(name = "staff_type_id", nullable = false)
     private StaffTypeEntity staffType;
 
+    @Builder.Default
     @Column(name = "assigned_date", nullable = false)
     private LocalDate assignedDate = LocalDate.now();
 
+    @Builder.Default
     @Column(name = "is_active", nullable = false)
     private boolean isActive = true;
 }

@@ -6,6 +6,7 @@ import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
@@ -18,13 +19,14 @@ public class SchoolInvitationController {
     @PostMapping
     public ResponseEntity<InvitationResponse> createInvitation(
             @PathVariable Long schoolId,
-            @RequestHeader("X-User-Id") Long inviterUserId,
-            @RequestHeader(value = "X-Super-User", defaultValue = "false") boolean isSuperUser,
+            JwtAuthenticationToken authentication,
             @Valid @RequestBody CreateInvitationRequest request) {
 
+        CurrentUser inviter = CurrentUser.from(authentication);
+
         String inviteLink = invitationService.createInvitation(
-                inviterUserId,
-                isSuperUser,
+                inviter.userId(),
+                inviter.superUser(),
                 schoolId,
                 request.email(),
                 request.targetRoleCode()
