@@ -139,12 +139,22 @@ public class AuthorizationServerConfig {
     /**
      * Browser flows: social login (Google, Facebook, Microsoft) backing /oauth2/authorize.
      */
+    /**
+     * Browser flows: social login (Google, Facebook, Microsoft) backing /oauth2/authorize.
+     */
     @Bean
     @Order(3)
     public SecurityFilterChain defaultSecurityFilterChain(HttpSecurity http) throws Exception {
         http
                 .authorizeHttpRequests(authorize -> authorize
-                        .requestMatchers("/login/**", "/oauth2/**", "/error").permitAll()
+                        .requestMatchers(
+                                "/login/**",
+                                "/oauth2/**",
+                                "/error",
+                                "/swagger-ui/**",
+                                "/swagger-ui.html",
+                                "/v3/api-docs/**"
+                        ).permitAll()
                         .anyRequest().authenticated()
                 )
                 .oauth2Login(Customizer.withDefaults());

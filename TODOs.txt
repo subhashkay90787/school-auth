@@ -1,0 +1,6 @@
+Add features for a school
+Remove features for a school
+Generate token only if the the school app is live and the super user console on the client side is allowing us to tunnel and control their system
+Multiple schools can be onboarded for a sys admin
+Multiple invitations can be sent for the same user (SYS ADMIN can own multiple schools and each school shall run the client app with our artifacts)
+Create a static html page to onboard the user
