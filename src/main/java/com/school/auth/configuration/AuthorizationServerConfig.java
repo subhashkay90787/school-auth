@@ -9,6 +9,7 @@ import com.school.auth.otp.OtpService;
 import com.school.auth.otp.PublicClientGrantAuthenticationConverter;
 import com.school.auth.otp.PublicClientGrantAuthenticationProvider;
 import com.school.auth.repository.UserRepository;
+import com.school.auth.service.SessionService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -26,11 +27,10 @@ import org.springframework.security.oauth2.core.ClientAuthenticationMethod;
 import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
 import org.springframework.security.oauth2.server.authorization.JdbcOAuth2AuthorizationService;
 import org.springframework.security.oauth2.server.authorization.OAuth2AuthorizationService;
-import org.springframework.security.oauth2.server.authorization.client.InMemoryRegisteredClientRepository;
-import org.springframework.security.oauth2.server.authorization.client.RegisteredClient;
+import org.springframework.security.crypto.factory.PasswordEncoderFactories;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.oauth2.server.authorization.client.JdbcRegisteredClientRepository;
 import org.springframework.security.oauth2.server.authorization.client.RegisteredClientRepository;
-import org.springframework.security.oauth2.server.authorization.settings.ClientSettings;
-import org.springframework.security.oauth2.server.authorization.settings.TokenSettings;
 import org.springframework.security.oauth2.server.authorization.token.DelegatingOAuth2TokenGenerator;
 import org.springframework.security.oauth2.server.authorization.token.JwtEncodingContext;
 import org.springframework.security.oauth2.server.authorization.token.JwtGenerator;
@@ -45,13 +45,14 @@ import org.springframework.security.web.util.matcher.MediaTypeRequestMatcher;
 import tools.jackson.databind.json.JsonMapper;
 import tools.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
 
-import java.time.Duration;
 import java.util.Set;
 
 @Configuration
 public class AuthorizationServerConfig {
 
     public static final String SUPER_USER_AUTHORITY = "SUPER_USER";
+    /** Scope of internal service clients (school-app-server directory refresh, role-holder lookups). */
+    public static final String DIRECTORY_READ_SCOPE = "directory.read";
 
     /**
      * OAuth2 / OIDC protocol endpoints: /oauth2/token, /oauth2/authorize, /oauth2/jwks, /userinfo, ...
@@ -64,7 +65,8 @@ public class AuthorizationServerConfig {
             OAuth2TokenGenerator<?> tokenGenerator,
             RegisteredClientRepository registeredClientRepository,
             UserRepository userRepository,
-            OtpService otpService) throws Exception {
+            OtpService otpService,
+            SessionService sessionService) throws Exception {
 
         OAuth2AuthorizationServerConfigurer authorizationServerConfigurer =
                 new OAuth2AuthorizationServerConfigurer();
@@ -85,7 +87,8 @@ public class AuthorizationServerConfig {
                                                 authorizationService,
                                                 tokenGenerator,
                                                 userRepository,
-                                                otpService
+                                                otpService,
+                                                sessionService
                                         ))
                                 )
                 )
@@ -112,10 +115,26 @@ public class AuthorizationServerConfig {
     }
 
     /**
-     * REST APIs, protected by access tokens issued by this server.
+     * Internal service APIs (client_credentials tokens with the directory.read scope).
      */
     @Bean
     @Order(2)
+    public SecurityFilterChain internalSecurityFilterChain(HttpSecurity http) throws Exception {
+        http
+                .securityMatcher("/internal/**")
+                .csrf(csrf -> csrf.disable())
+                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(authorize -> authorize
+                        .anyRequest().hasAuthority("SCOPE_" + DIRECTORY_READ_SCOPE))
+                .oauth2ResourceServer(resourceServer -> resourceServer.jwt(Customizer.withDefaults()));
+        return http.build();
+    }
+
+    /**
+     * REST APIs, protected by access tokens issued by this server.
+     */
+    @Bean
+    @Order(3)
     public SecurityFilterChain apiSecurityFilterChain(HttpSecurity http) throws Exception {
         http
                 .securityMatcher("/api/**")
@@ -123,11 +142,13 @@ public class AuthorizationServerConfig {
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(authorize -> authorize
                         .requestMatchers("/api/v1/otp/**", "/api/v1/onboarding/**").permitAll()
-                        .requestMatchers(HttpMethod.POST, "/api/v1/schools").hasAuthority(SUPER_USER_AUTHORITY)
+                        .requestMatchers(HttpMethod.GET, "/api/v1/apps/*/config").permitAll()
+                        .requestMatchers("/api/v1/platform/**").hasAuthority(SUPER_USER_AUTHORITY)
                         .requestMatchers(HttpMethod.PATCH, "/api/v1/schools/*/status").hasAuthority(SUPER_USER_AUTHORITY)
                         .requestMatchers("/api/v1/schools/*/features/**").hasAuthority(SUPER_USER_AUTHORITY)
                         .requestMatchers(HttpMethod.DELETE, "/api/v1/users/*").hasAuthority(SUPER_USER_AUTHORITY)
-                        // Invite/remove permissions depend on the caller's per-school role; checked in the services via RoleHierarchy
+                        // Branch-level permissions (USER_MANAGE, ROLE_MANAGE, ...) are checked in the services
+                        // against the database via SchoolAccessService
                         .anyRequest().authenticated()
                 )
                 .oauth2ResourceServer(resourceServer -> resourceServer
@@ -139,11 +160,8 @@ public class AuthorizationServerConfig {
     /**
      * Browser flows: social login (Google, Facebook, Microsoft) backing /oauth2/authorize.
      */
-    /**
-     * Browser flows: social login (Google, Facebook, Microsoft) backing /oauth2/authorize.
-     */
     @Bean
-    @Order(3)
+    @Order(4)
     public SecurityFilterChain defaultSecurityFilterChain(HttpSecurity http) throws Exception {
         http
                 .authorizeHttpRequests(authorize -> authorize
@@ -210,35 +228,17 @@ public class AuthorizationServerConfig {
         return new DelegatingOAuth2TokenGenerator(jwtGenerator, new OAuth2RefreshTokenGenerator());
     }
 
+    /**
+     * Clients live in oauth2_registered_client: the generic mobile client and internal service clients are
+     * written at startup by {@link OAuthClientBootstrap}; dedicated apps are added by the super user.
+     */
     @Bean
-    public RegisteredClientRepository registeredClientRepository(
-            @Value("${oauth2.client.mobile.client-id}") String mobileClientId,
-            @Value("${oauth2.token.access-token-time-to-live-minutes}") long accessTokenTtlMinutes,
-            @Value("${oauth2.token.refresh-token-time-to-live-days}") long refreshTokenTtlDays) {
-        // Stable id: stored authorizations reference it, so it must not change across restarts
-        RegisteredClient registeredClient = RegisteredClient.withId(mobileClientId)
-                .clientId(mobileClientId)
-                .clientAuthenticationMethod(ClientAuthenticationMethod.NONE) // Mobile app PKCE client
-                .authorizationGrantType(AuthorizationGrantType.AUTHORIZATION_CODE)
-                .authorizationGrantType(AuthorizationGrantType.REFRESH_TOKEN)
-                // Register Custom OTP Grant Type
-                .authorizationGrantType(OAuth2OtpAuthenticationToken.OTP_GRANT_TYPE)
-                .redirectUri("com.yourplatform.app://oauth2redirect")
-                .scope("openid")
-                .scope("profile")
-                .scope("email")
-                .scope("school_access")
-                .clientSettings(ClientSettings.builder()
-                        .requireProofKey(true) // Enforce PKCE for mobile apps
-                        .requireAuthorizationConsent(false)
-                        .build())
-                .tokenSettings(TokenSettings.builder()
-                        .accessTokenTimeToLive(Duration.ofMinutes(accessTokenTtlMinutes))
-                        .refreshTokenTimeToLive(Duration.ofDays(refreshTokenTtlDays))
-                        .reuseRefreshTokens(false)
-                        .build())
-                .build();
+    public RegisteredClientRepository registeredClientRepository(JdbcOperations jdbcOperations) {
+        return new JdbcRegisteredClientRepository(jdbcOperations);
+    }
 
-        return new InMemoryRegisteredClientRepository(registeredClient);
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return PasswordEncoderFactories.createDelegatingPasswordEncoder();
     }
 }

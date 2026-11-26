@@ -1,7 +1,9 @@
 package com.school.auth.otp;
 
 import com.school.auth.entity.UserEntity;
+import com.school.auth.entity.UserSessionEntity;
 import com.school.auth.repository.UserRepository;
+import com.school.auth.service.SessionService;
 import org.springframework.security.authentication.AuthenticationProvider;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
@@ -26,6 +28,7 @@ import java.security.Principal;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 public class OAuth2OtpAuthenticationProvider implements AuthenticationProvider {
 
@@ -35,16 +38,19 @@ public class OAuth2OtpAuthenticationProvider implements AuthenticationProvider {
     private final OAuth2TokenGenerator<? extends OAuth2Token> tokenGenerator;
     private final UserRepository userRepository;
     private final OtpService otpService;
+    private final SessionService sessionService;
 
     public OAuth2OtpAuthenticationProvider(
             OAuth2AuthorizationService authorizationService,
             OAuth2TokenGenerator<? extends OAuth2Token> tokenGenerator,
             UserRepository userRepository,
-            OtpService otpService) {
+            OtpService otpService,
+            SessionService sessionService) {
         this.authorizationService = authorizationService;
         this.tokenGenerator = tokenGenerator;
         this.userRepository = userRepository;
         this.otpService = otpService;
+        this.sessionService = sessionService;
     }
 
     @Override
@@ -58,22 +64,47 @@ public class OAuth2OtpAuthenticationProvider implements AuthenticationProvider {
             throw new OAuth2AuthenticationException(OAuth2ErrorCodes.UNAUTHORIZED_CLIENT);
         }
 
-        String inputPhone = OtpService.normalizePhone(otpAuthToken.getPhoneNumber());
+        OtpChannel channel = otpAuthToken.getChannel();
+        String identifier = OtpService.normalize(channel, otpAuthToken.getIdentifier());
         String otp = (String) otpAuthToken.getCredentials();
+        String ip = otpAuthToken.parameter("ip_address");
+        String deviceId = otpAuthToken.parameter("device_id");
+        Long schoolId = parseLong(otpAuthToken.parameter("school_id"));
 
-        // 2. Validate OTP against Redis first, so the response doesn't reveal whether the phone is registered
-        if (!otpService.verifyOtp(inputPhone, otp)) {
+        // 2. Validate OTP against Redis first, so the response doesn't reveal whether the identifier is registered
+        OtpService.Result result = otpService.verify(channel, identifier, otp);
+        if (result != OtpService.Result.OK) {
+            sessionService.recordAttempt(identifier, channel.authMethod,
+                    switch (result) {
+                        case EXPIRED -> "EXPIRED_OTP";
+                        case LOCKED -> "LOCKED";
+                        default -> "WRONG_OTP";
+                    }, null, schoolId, ip, deviceId);
             throw invalidGrant("Invalid or expired OTP.");
         }
 
-        // 3. Query DB to match either primary or alternative phone number
-        UserEntity userEntity = userRepository.findByPhoneNumberOrAlternate(inputPhone)
+        // 3. Find the account: phone matches primary or alternate number; email is case-insensitive
+        UserEntity userEntity = (channel == OtpChannel.EMAIL
+                ? userRepository.findByEmailIgnoreCase(identifier)
+                : userRepository.findByPhoneNumberOrAlternate(identifier))
                 .filter(UserEntity::isActiveFlag)
-                .orElseThrow(() -> invalidGrant("Invalid or expired OTP."));
+                .orElse(null);
+        if (userEntity == null) {
+            sessionService.recordAttempt(identifier, channel.authMethod, "WRONG_OTP", null, schoolId, ip, deviceId);
+            throw invalidGrant("Invalid or expired OTP.");
+        }
 
-        // 4. Build user principal using the user's email (resolved again by CustomJwtTokenCustomizerConfig)
+        // 4. Principal = user id (email is optional). Resolved again by CustomJwtTokenCustomizerConfig.
         Authentication userAuth = UsernamePasswordAuthenticationToken.authenticated(
-                userEntity.getEmail(), null, Collections.emptyList());
+                userEntity.getUserId().toString(), null, Collections.emptyList());
+
+        // The session (refresh-token family) exists before the tokens, so the access token can carry its id
+        String authorizationId = UUID.randomUUID().toString();
+        UserSessionEntity session = sessionService.openSession(userEntity.getUserId(), registeredClient.getClientId(),
+                authorizationId, channel.authMethod, new SessionService.DeviceContext(deviceId,
+                        otpAuthToken.parameter("device_name"), otpAuthToken.parameter("platform"),
+                        otpAuthToken.parameter("app_version"), ip, otpAuthToken.parameter("user_agent"), schoolId));
+        otpAuthToken.setAuthorizationId(authorizationId);
 
         // 5. Build Token Context (This triggers your CustomJwtTokenCustomizerConfig automatically)
         DefaultOAuth2TokenContext.Builder tokenContextBuilder = DefaultOAuth2TokenContext.builder()
@@ -88,7 +119,16 @@ public class OAuth2OtpAuthenticationProvider implements AuthenticationProvider {
                 .authorizedScopes(registeredClient.getScopes())
                 .build();
 
-        OAuth2Token generatedAccessToken = this.tokenGenerator.generate(accessTokenContext);
+        OAuth2Token generatedAccessToken;
+        try {
+            generatedAccessToken = this.tokenGenerator.generate(accessTokenContext);
+        } catch (OAuth2AuthenticationException ex) {
+            // e.g. no active branch: the customizer refused the token
+            sessionService.end(session, "REVOKED_BY_ADMIN", null);
+            sessionService.recordAttempt(identifier, channel.authMethod, "BLOCKED_INACTIVE_BRANCH",
+                    userEntity.getUserId(), schoolId, ip, deviceId);
+            throw ex;
+        }
         if (generatedAccessToken == null) {
             throw new OAuth2AuthenticationException(new OAuth2Error(OAuth2ErrorCodes.SERVER_ERROR));
         }
@@ -103,6 +143,7 @@ public class OAuth2OtpAuthenticationProvider implements AuthenticationProvider {
 
         // 6. Save authorization state. The principal attribute is needed later by the refresh_token grant.
         OAuth2Authorization.Builder authorizationBuilder = OAuth2Authorization.withRegisteredClient(registeredClient)
+                .id(authorizationId)
                 .principalName(userAuth.getName())
                 .authorizationGrantType(OAuth2OtpAuthenticationToken.OTP_GRANT_TYPE)
                 .authorizedScopes(registeredClient.getScopes())
@@ -152,6 +193,7 @@ public class OAuth2OtpAuthenticationProvider implements AuthenticationProvider {
 
         OAuth2Authorization authorization = authorizationBuilder.build();
         this.authorizationService.save(authorization);
+        sessionService.recordAttempt(identifier, channel.authMethod, "SUCCESS", userEntity.getUserId(), schoolId, ip, deviceId);
 
         // 9. Return the token response (id_token goes in the additional parameters)
         return new OAuth2AccessTokenAuthenticationToken(
@@ -177,6 +219,14 @@ public class OAuth2OtpAuthenticationProvider implements AuthenticationProvider {
             return clientPrincipal;
         }
         throw new OAuth2AuthenticationException(new OAuth2Error(OAuth2ErrorCodes.INVALID_CLIENT));
+    }
+
+    private static Long parseLong(String value) {
+        try {
+            return value == null ? null : Long.valueOf(value);
+        } catch (NumberFormatException e) {
+            throw new OAuth2AuthenticationException(OAuth2ErrorCodes.INVALID_REQUEST);
+        }
     }
 
     private static OAuth2AuthenticationException invalidGrant(String description) {

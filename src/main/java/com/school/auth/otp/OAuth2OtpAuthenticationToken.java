@@ -13,18 +13,24 @@ public class OAuth2OtpAuthenticationToken extends AbstractAuthenticationToken {
             new AuthorizationGrantType("urn:ietf:params:oauth:grant-type:otp");
 
     private final Authentication clientPrincipal;
-    private final String phoneNumber;
+    private final OtpChannel channel;
+    private final String identifier;
     private final String otp;
     private final Map<String, Object> additionalParameters;
 
+    /** Set by the provider once the session row exists; read by the token customizer (claim "sid"). */
+    private String authorizationId;
+
     public OAuth2OtpAuthenticationToken(
             Authentication clientPrincipal,
-            String phoneNumber,
+            OtpChannel channel,
+            String identifier,
             String otp,
             Map<String, Object> additionalParameters) {
         super(Collections.emptyList());
         this.clientPrincipal = clientPrincipal;
-        this.phoneNumber = phoneNumber;
+        this.channel = channel;
+        this.identifier = identifier;
         this.otp = otp;
         this.additionalParameters = additionalParameters;
         setAuthenticated(false);
@@ -40,11 +46,29 @@ public class OAuth2OtpAuthenticationToken extends AbstractAuthenticationToken {
         return this.otp;
     }
 
-    public String getPhoneNumber() {
-        return this.phoneNumber;
+    public OtpChannel getChannel() {
+        return channel;
+    }
+
+    /** Phone number (WHATSAPP) or email (EMAIL), as sent by the client. */
+    public String getIdentifier() {
+        return identifier;
     }
 
     public Map<String, Object> getAdditionalParameters() {
         return this.additionalParameters;
+    }
+
+    public String getAuthorizationId() {
+        return authorizationId;
+    }
+
+    void setAuthorizationId(String authorizationId) {
+        this.authorizationId = authorizationId;
+    }
+
+    public String parameter(String name) {
+        Object value = additionalParameters.get(name);
+        return value == null ? null : value.toString();
     }
 }

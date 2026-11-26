@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -18,6 +19,7 @@ import org.springframework.util.StringUtils;
  */
 @Slf4j
 @Component
+@Order(2)
 @RequiredArgsConstructor
 public class SuperUserBootstrap implements ApplicationRunner {
 
@@ -49,7 +51,7 @@ public class SuperUserBootstrap implements ApplicationRunner {
                 throw new IllegalStateException("app.super-user.phone is required to create the super user " + email);
             }
             user = UserEntity.builder()
-                    .email(email.trim().toLowerCase())
+                    .email(OtpService.normalizeEmail(email))
                     .phoneNumber(OtpService.normalizePhone(phone))
                     .firstName(firstName)
                     .lastName(lastName)
