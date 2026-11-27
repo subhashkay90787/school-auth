@@ -10,39 +10,51 @@ import org.springframework.util.StringUtils;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 
+/**
+ * grant_type=urn:ietf:params:oauth:grant-type:otp with either {@code phone} (WhatsApp OTP) or {@code email}
+ * (email OTP), plus {@code otp}. Optional device context: device_id, device_name, platform, app_version,
+ * school_id (branch chosen at sign-in).
+ */
 public class OAuth2OtpAuthenticationConverter implements AuthenticationConverter {
+
+    private static final Set<String> CONSUMED = Set.of("grant_type", "phone", "email", "otp");
 
     @Override
     public Authentication convert(HttpServletRequest request) {
-        // 1. Verify grant_type matches custom OTP grant type
         String grantType = request.getParameter("grant_type");
         if (!OAuth2OtpAuthenticationToken.OTP_GRANT_TYPE.getValue().equals(grantType)) {
             return null;
         }
 
-        // 2. Extract phone and otp request parameters
         String phone = request.getParameter("phone");
+        String email = request.getParameter("email");
         String otp = request.getParameter("otp");
-
-        if (!StringUtils.hasText(phone) || !StringUtils.hasText(otp)) {
+        if (StringUtils.hasText(phone) == StringUtils.hasText(email) || !StringUtils.hasText(otp)) {
+            // exactly one of phone / email is required
             throw new OAuth2AuthenticationException(OAuth2ErrorCodes.INVALID_REQUEST);
         }
 
-        // 3. Extract client principal (authenticated via public client / client credentials)
         Authentication clientPrincipal = SecurityContextHolder.getContext().getAuthentication();
         if (clientPrincipal == null) {
             return null;
         }
 
-        // 4. Capture any additional parameters
         Map<String, Object> additionalParameters = new HashMap<>();
         request.getParameterMap().forEach((key, value) -> {
-            if (!key.equals("grant_type") && !key.equals("phone") && !key.equals("otp")) {
+            if (!CONSUMED.contains(key)) {
                 additionalParameters.put(key, value[0]);
             }
         });
+        additionalParameters.put("ip_address", request.getRemoteAddr());
+        String userAgent = request.getHeader("User-Agent");
+        if (userAgent != null) {
+            additionalParameters.put("user_agent", userAgent.length() > 500 ? userAgent.substring(0, 500) : userAgent);
+        }
 
-        return new OAuth2OtpAuthenticationToken(clientPrincipal, phone, otp, additionalParameters);
+        OtpChannel channel = StringUtils.hasText(phone) ? OtpChannel.WHATSAPP : OtpChannel.EMAIL;
+        return new OAuth2OtpAuthenticationToken(clientPrincipal, channel, StringUtils.hasText(phone) ? phone : email,
+                otp, additionalParameters);
     }
 }

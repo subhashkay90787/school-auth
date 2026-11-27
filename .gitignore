@@ -35,3 +35,4 @@ build/
 ### Local env ###
 .env
 keys/
+dump.rdb

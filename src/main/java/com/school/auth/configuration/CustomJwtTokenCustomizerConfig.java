@@ -2,13 +2,18 @@ package com.school.auth.configuration;
 
 import com.school.auth.dto.TokenPayloadDto;
 import com.school.auth.entity.UserEntity;
+import com.school.auth.entity.UserSessionEntity;
+import com.school.auth.otp.OAuth2OtpAuthenticationToken;
 import com.school.auth.repository.UserRepository;
-import com.school.auth.service.SchoolGrantService;
+import com.school.auth.repository.UserSessionRepository;
+import com.school.auth.service.SessionService;
+import com.school.auth.service.TokenClaimsService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.oauth2.client.authentication.OAuth2AuthenticationToken;
+import org.springframework.security.oauth2.core.AuthorizationGrantType;
 import org.springframework.security.oauth2.core.OAuth2AuthenticationException;
 import org.springframework.security.oauth2.core.OAuth2Error;
 import org.springframework.security.oauth2.core.OAuth2ErrorCodes;
@@ -22,6 +27,16 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Access-token claims for user tokens:
+ * <pre>
+ *   user_id, sid (session id), user_details, roles (platform: ["SUPER_USER"]),
+ *   school_access: [{school_id, ..., roles, base_roles, permissions, enabled_features, perm_version}]
+ * </pre>
+ * Everything is re-read from the database on every issuance and refresh, so deactivating a user, suspending a
+ * branch or changing a role mapping takes effect at the next refresh. Client-credentials tokens (internal
+ * service clients) carry no user claims.
+ */
 @Configuration
 @RequiredArgsConstructor
 public class CustomJwtTokenCustomizerConfig {
@@ -30,67 +45,85 @@ public class CustomJwtTokenCustomizerConfig {
     private static final TypeReference<List<Map<String, Object>>> LIST_OF_MAPS_TYPE = new TypeReference<>() {};
 
     private final UserRepository userRepository;
-    private final SchoolGrantService schoolGrantService;
+    private final UserSessionRepository sessionRepository;
+    private final SessionService sessionService;
+    private final TokenClaimsService tokenClaimsService;
     private final JsonMapper jsonMapper;
 
     @Bean
     public OAuth2TokenCustomizer<JwtEncodingContext> jwtTokenCustomizer() {
         return context -> {
-            // Target only ACCESS_TOKEN generation
-            if (OAuth2TokenType.ACCESS_TOKEN.equals(context.getTokenType())) {
-                Authentication principal = context.getPrincipal();
-
-                // 1. Fetch user entity dynamically from the database (invite-only: unknown users are rejected)
-                String email = resolveEmail(principal);
-                UserEntity userEntity = userRepository.findByEmailIgnoreCase(email)
-                        .filter(UserEntity::isActiveFlag)
-                        .orElseThrow(() -> accessDenied("No active account is registered for " + email));
-
-                // 2. Map database entity to your DTO
-                TokenPayloadDto.UserDetails userDetails = new TokenPayloadDto.UserDetails(
-                        userEntity.getUserId(),
-                        userEntity.getFirstName(),
-                        userEntity.getLastName(),
-                        userEntity.getEmail(),
-                        userEntity.getPhoneNumber(),
-                        userEntity.getAlternatePhoneNumber(),
-                        "STAFF", // Or derive user category from database if stored
-                        userEntity.isActiveFlag()
-                );
-
-                // 3. Platform-wide roles come from the database, not from the login provider.
-                //    Mutable ArrayList on purpose: List.of() is rejected when the stored claims are read back.
-                List<String> globalRoles = new ArrayList<>();
-                if (userEntity.isSuperUser()) {
-                    globalRoles.add(AuthorizationServerConfig.SUPER_USER_AUTHORITY);
-                }
-
-                // 4. Fetch multi-school access and feature grants dynamically
-                List<TokenPayloadDto.SchoolAccess> schoolAccessList = schoolGrantService.getSchoolGrantsForUser(userEntity.getUserId());
-
-                // Every non-super user must belong to at least one active school. This is re-checked against the
-                // database on every issuance and refresh, so disabling a school blocks its users immediately.
-                if (!userEntity.isSuperUser() && schoolAccessList.isEmpty()) {
-                    throw accessDenied("No active school access: your school has been disabled or your access was removed");
-                }
-
-                // 5. Inject claims. DTOs are converted to plain maps (honouring @JsonProperty names) because
-                //    claims are also persisted by JdbcOAuth2AuthorizationService, which only deserializes JDK types.
-                context.getClaims().claims(claims -> {
-                    claims.put("user_id", userEntity.getUserId());
-                    claims.put("user_details", jsonMapper.convertValue(userDetails, MAP_TYPE));
-                    claims.put("roles", globalRoles);
-                    claims.put("school_access", jsonMapper.convertValue(schoolAccessList, LIST_OF_MAPS_TYPE));
-                });
+            if (!OAuth2TokenType.ACCESS_TOKEN.equals(context.getTokenType())
+                    || AuthorizationGrantType.CLIENT_CREDENTIALS.equals(context.getAuthorizationGrantType())) {
+                return;
             }
+            String clientId = context.getRegisteredClient().getClientId();
+
+            // 1. The user (invite-only: unknown or deactivated users are rejected)
+            UserEntity user = resolveUser(context.getPrincipal())
+                    .filter(UserEntity::isActiveFlag)
+                    .orElseThrow(() -> accessDenied("No active account is registered for this sign-in"));
+
+            // 2. Dedicated apps must be ACTIVE to issue tokens at all
+            tokenClaimsService.dedicatedAppStatus(clientId)
+                    .filter(status -> !"ACTIVE".equals(status))
+                    .ifPresent(status -> {
+                        throw accessDenied("This app is not available right now (" + status + ")");
+                    });
+
+            // 3. Session: created by the OTP grant; touched (or created, for social sign-in) otherwise
+            UserSessionEntity session = resolveSession(context, user, clientId);
+
+            // 4. Platform roles come from the database, not from the login provider.
+            //    Mutable lists on purpose: List.of() is rejected when stored claims are read back.
+            List<String> globalRoles = new ArrayList<>();
+            if (user.isSuperUser()) {
+                globalRoles.add(AuthorizationServerConfig.SUPER_USER_AUTHORITY);
+            }
+
+            // 5. Branch access with roles, base roles, permissions and features
+            List<TokenPayloadDto.SchoolAccess> schoolAccess = tokenClaimsService.schoolAccess(user.getUserId(), clientId);
+            if (!user.isSuperUser() && schoolAccess.isEmpty()) {
+                throw accessDenied("No active school access: your branch is not live, was suspended, or your access was removed");
+            }
+
+            TokenPayloadDto.UserDetails details = new TokenPayloadDto.UserDetails(
+                    user.getUserId(), user.getFirstName(), user.getLastName(), user.getEmail(),
+                    user.getPhoneNumber(), user.getAlternatePhoneNumber(), user.getUserCategory(), user.isActiveFlag());
+
+            // 6. DTOs become plain maps (honouring @JsonProperty names): claims are also persisted by
+            //    JdbcOAuth2AuthorizationService, which only deserializes JDK types.
+            context.getClaims().claims(claims -> {
+                claims.put("user_id", user.getUserId());
+                if (session != null) {
+                    claims.put("sid", session.getSessionId().toString());
+                }
+                claims.put("user_details", jsonMapper.convertValue(details, MAP_TYPE));
+                claims.put("roles", globalRoles);
+                claims.put("school_access", jsonMapper.convertValue(schoolAccess, LIST_OF_MAPS_TYPE));
+            });
         };
     }
 
+    private UserSessionEntity resolveSession(JwtEncodingContext context, UserEntity user, String clientId) {
+        if (context.getAuthorizationGrant() instanceof OAuth2OtpAuthenticationToken otp && otp.getAuthorizationId() != null) {
+            return sessionRepository.findByRefreshTokenFamilyId(otp.getAuthorizationId()).orElse(null);
+        }
+        if (context.getAuthorization() != null) {
+            try {
+                return sessionService.touchOrOpen(user.getUserId(), clientId, context.getAuthorization().getId());
+            } catch (IllegalStateException ended) {
+                throw new OAuth2AuthenticationException(new OAuth2Error(OAuth2ErrorCodes.INVALID_GRANT, ended.getMessage(), null));
+            }
+        }
+        return null;
+    }
+
     /**
-     * OTP logins use the email as the principal name. Social logins expose the provider's subject id as the
-     * name, so the email is read from the provider attributes instead.
+     * OTP sign-ins use the user id as the principal name (older authorizations used the email). Social logins
+     * expose the provider's subject id, so the email is read from the provider attributes instead.
      */
-    private static String resolveEmail(Authentication principal) {
+    private java.util.Optional<UserEntity> resolveUser(Authentication principal) {
         if (principal instanceof OAuth2AuthenticationToken oauth2) {
             Map<String, Object> attributes = oauth2.getPrincipal().getAttributes();
             if (Boolean.FALSE.equals(attributes.get("email_verified"))) {
@@ -104,9 +137,13 @@ public class CustomJwtTokenCustomizerConfig {
             if (email == null) {
                 throw accessDenied("The " + oauth2.getAuthorizedClientRegistrationId() + " account did not provide an email address");
             }
-            return email.toString();
+            return userRepository.findByEmailIgnoreCase(email.toString());
         }
-        return principal.getName();
+        String name = principal.getName();
+        if (name != null && name.chars().allMatch(Character::isDigit)) {
+            return userRepository.findById(Long.valueOf(name));
+        }
+        return userRepository.findByEmailIgnoreCase(name);
     }
 
     private static OAuth2AuthenticationException accessDenied(String description) {

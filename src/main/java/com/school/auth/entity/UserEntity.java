@@ -12,6 +12,11 @@ import lombok.*;
 @Builder
 public class UserEntity {
 
+    public static final String CATEGORY_STAFF = "STAFF";
+    public static final String CATEGORY_NON_STAFF = "NON_STAFF";
+    public static final String CATEGORY_PARENT = "PARENT";
+    public static final String CATEGORY_STUDENT = "STUDENT";
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     @Column(name = "user_id")
@@ -29,8 +34,13 @@ public class UserEntity {
     @Column(name = "alternate_phone_number", length = 20)
     private String alternatePhoneNumber;
 
-    @Column(name = "email", unique = true, nullable = false, length = 100)
+    // Optional: WhatsApp-only users (many parents) have no email
+    @Column(name = "email", unique = true, length = 100)
     private String email;
+
+    @Builder.Default
+    @Column(name = "user_category", nullable = false, length = 20)
+    private String userCategory = CATEGORY_STAFF;
 
     @Builder.Default
     @Column(name = "is_active_flag", nullable = false)

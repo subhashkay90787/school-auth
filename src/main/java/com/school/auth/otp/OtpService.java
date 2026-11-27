@@ -1,6 +1,5 @@
 package com.school.auth.otp;
 
-import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -9,56 +8,94 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.HexFormat;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
- * Issues and verifies one-time passwords stored in Redis.
+ * Issues and verifies one-time passwords stored in Redis, delivered over WhatsApp (phone) or email.
  *
- * Keys per phone number:
- *   otp:code:{phone}      SHA-256 of the code, expires after app.otp.ttl
- *   otp:attempts:{phone}  failed verification counter, same TTL
- *   otp:cooldown:{phone}  blocks re-sending until app.otp.resend-cooldown elapses
+ * Keys per identifier (normalized phone or lower-cased email):
+ *   otp:code:{id}      SHA-256 of the code, expires after app.otp.ttl
+ *   otp:attempts:{id}  failed verification counter, same TTL
+ *   otp:cooldown:{id}  blocks re-sending until app.otp.resend-cooldown elapses
  */
 @Service
-@RequiredArgsConstructor
 public class OtpService {
+
+    /** Outcome of a verification, so callers can log WRONG_OTP / EXPIRED_OTP / LOCKED separately. */
+    public enum Result { OK, WRONG, EXPIRED, LOCKED }
 
     private static final String CODE_KEY = "otp:code:";
     private static final String ATTEMPTS_KEY = "otp:attempts:";
     private static final String COOLDOWN_KEY = "otp:cooldown:";
 
     private final StringRedisTemplate redis;
-    private final SmsSender smsSender;
     private final OtpProperties properties;
+    private final Map<OtpChannel, OtpSender> senders;
     private final SecureRandom random = new SecureRandom();
+
+    public OtpService(StringRedisTemplate redis, OtpProperties properties, List<OtpSender> senders) {
+        this.redis = redis;
+        this.properties = properties;
+        this.senders = senders.stream().collect(Collectors.toMap(OtpSender::channel, Function.identity()));
+    }
 
     public static String normalizePhone(String phone) {
         return phone == null ? null : phone.replaceAll("[\\s\\-()]", "");
     }
 
-    public void sendOtp(String rawPhone) {
-        String phone = normalizePhone(rawPhone);
+    public static String normalizeEmail(String email) {
+        return email == null ? null : email.trim().toLowerCase(Locale.ROOT);
+    }
 
-        Boolean allowed = redis.opsForValue().setIfAbsent(COOLDOWN_KEY + phone, "1", properties.resendCooldown());
+    public static String normalize(OtpChannel channel, String identifier) {
+        return channel == OtpChannel.EMAIL ? normalizeEmail(identifier) : normalizePhone(identifier);
+    }
+
+    /** SHA-256 hex of the normalized identifier, for login_attempt.identifier_hash. */
+    public static String identifierHash(String normalizedIdentifier) {
+        return hash(normalizedIdentifier);
+    }
+
+    public void sendOtp(OtpChannel channel, String rawIdentifier) {
+        String id = normalize(channel, rawIdentifier);
+
+        Boolean allowed = redis.opsForValue().setIfAbsent(COOLDOWN_KEY + id, "1", properties.resendCooldown());
         if (!Boolean.TRUE.equals(allowed)) {
             throw new OtpRateLimitedException("An OTP was sent recently. Please wait before requesting another.");
         }
 
         String code = generateCode();
-        redis.opsForValue().set(CODE_KEY + phone, hash(code), properties.ttl());
-        redis.delete(ATTEMPTS_KEY + phone);
+        redis.opsForValue().set(CODE_KEY + id, hash(code), properties.ttl());
+        redis.delete(ATTEMPTS_KEY + id);
 
-        smsSender.send(phone, "Your verification code is " + code
-                + ". It expires in " + properties.ttl().toMinutes() + " minutes.");
+        OtpSender sender = senders.get(channel);
+        if (sender == null) {
+            throw new IllegalStateException("No OTP sender configured for " + channel);
+        }
+        sender.send(id, code, properties.ttl().toMinutes());
+    }
+
+    /** Phone OTPs (onboarding, profile phone changes) are sent over WhatsApp. */
+    public void sendOtp(String rawPhone) {
+        sendOtp(OtpChannel.WHATSAPP, rawPhone);
+    }
+
+    public boolean verifyOtp(String rawPhone, String code) {
+        return verify(OtpChannel.WHATSAPP, rawPhone, code) == Result.OK;
     }
 
     /**
-     * Returns true exactly once for a correct, unexpired code. The code is consumed on success
-     * and invalidated after app.otp.max-attempts failed tries.
+     * Succeeds exactly once for a correct, unexpired code: the code is consumed on success and invalidated
+     * after app.otp.max-attempts failed tries.
      */
-    public boolean verifyOtp(String rawPhone, String code) {
-        String phone = normalizePhone(rawPhone);
-        String codeKey = CODE_KEY + phone;
-        String attemptsKey = ATTEMPTS_KEY + phone;
+    public Result verify(OtpChannel channel, String rawIdentifier, String code) {
+        String id = normalize(channel, rawIdentifier);
+        String codeKey = CODE_KEY + id;
+        String attemptsKey = ATTEMPTS_KEY + id;
 
         Long attempts = redis.opsForValue().increment(attemptsKey);
         if (attempts != null && attempts == 1) {
@@ -66,12 +103,15 @@ public class OtpService {
         }
         if (attempts == null || attempts > properties.maxAttempts()) {
             redis.delete(codeKey);
-            return false;
+            return Result.LOCKED;
         }
 
         String storedHash = redis.opsForValue().get(codeKey);
-        if (storedHash == null || code == null) {
-            return false;
+        if (storedHash == null) {
+            return Result.EXPIRED;
+        }
+        if (code == null) {
+            return Result.WRONG;
         }
 
         boolean matches = MessageDigest.isEqual(
@@ -81,9 +121,9 @@ public class OtpService {
         // Deleting the key is the "consume" step; only the caller that actually deletes it wins
         if (matches && Boolean.TRUE.equals(redis.delete(codeKey))) {
             redis.delete(attemptsKey);
-            return true;
+            return Result.OK;
         }
-        return false;
+        return Result.WRONG;
     }
 
     private String generateCode() {

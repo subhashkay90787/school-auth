@@ -17,7 +17,8 @@ import java.util.Objects;
 public class UserAccountService {
 
     private final UserRepository userRepository;
-    private final SchoolGrantService schoolGrantService;
+    private final TokenClaimsService tokenClaimsService;
+    private final SessionService sessionService;
     private final OtpService otpService;
 
     @Transactional(readOnly = true)
@@ -74,8 +75,9 @@ public class UserAccountService {
     }
 
     /**
-     * Platform-wide removal (super user only). The account is deactivated rather than deleted: it can no longer
-     * log in or refresh tokens (CustomJwtTokenCustomizerConfig rejects inactive users), and history is kept.
+     * Platform-wide removal (super user only). The account is deactivated rather than deleted: its sessions end,
+     * it can no longer log in or refresh tokens (CustomJwtTokenCustomizerConfig rejects inactive users), and
+     * history is kept.
      */
     @Transactional
     public void deactivateUser(Long actorUserId, Long targetUserId) {
@@ -88,6 +90,7 @@ public class UserAccountService {
             throw new SecurityException("A super user account cannot be deactivated through the API.");
         }
         target.setActiveFlag(false);
+        sessionService.endAllSessions(targetUserId, "USER_DEACTIVATED", actorUserId, null);
     }
 
     private UserEntity findActiveUser(Long userId) {
@@ -113,7 +116,7 @@ public class UserAccountService {
                 user.getPhoneNumber(),
                 user.getAlternatePhoneNumber(),
                 user.isSuperUser(),
-                schoolGrantService.getSchoolGrantsForUser(user.getUserId())
+                tokenClaimsService.schoolAccess(user.getUserId(), null)
         );
     }
 }
